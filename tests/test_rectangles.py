@@ -18,7 +18,7 @@ def brute_force_rectangles(board, target=10):
 
 
 def test_rectangles():
-    board = np.random.randint(0, 10, size=(10, 17))
+    board = np.random.randint(1, 10, size=(10, 17))
 
     print("Board:")
     print(board)
