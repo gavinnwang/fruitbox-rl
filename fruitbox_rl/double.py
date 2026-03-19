@@ -10,7 +10,6 @@ import csv
 import os
 
 # --- Configuration ---
-SEED = 42
 ROWS, COLS = 10, 17
 BLOCK_SIZE = 30
 LR = 0.0003
@@ -23,57 +22,32 @@ EPS_END = 0.1
 EPS_DECAY = 20000 
 LOG_EVERY = 10
 RENDER_EVERY = 100
-CSV_FILE = "dqn_log.csv"
+CSV_FILE = "double_dqn_log.csv"
 
-# Set Seeds
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
-class ReplayBuffer:
-    def __init__(self, capacity, state_shape):
-        self.capacity = capacity
-        self.ptr = 0
-        self.size = 0
-        self.states = np.empty((capacity, *state_shape), dtype=np.float32)
-        self.actions = np.empty((capacity, 1), dtype=np.int64)
-        self.rewards = np.empty((capacity, 1), dtype=np.float32)
-        self.next_states = np.empty((capacity, *state_shape), dtype=np.float32)
-        self.masks = np.empty((capacity, 8415), dtype=np.bool_)
-        self.dones = np.empty((capacity, 1), dtype=np.float32)
-
-    def push(self, s, a, r, ns, m, d):
-        self.states[self.ptr] = s
-        self.actions[self.ptr] = a
-        self.rewards[self.ptr] = r
-        self.next_states[self.ptr] = ns
-        self.masks[self.ptr] = m
-        self.dones[self.ptr] = d
-        self.ptr = (self.ptr + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
-    def sample(self, batch_size):
-        idxs = np.random.randint(0, self.size, size=batch_size)
-        return (self.states[idxs], self.actions[idxs], self.rewards[idxs], 
-                self.next_states[idxs], self.masks[idxs], self.dones[idxs])
-
+# --- 1. The Model (CNN) ---
 class FruitBoxCNN(nn.Module):
     def __init__(self, num_actions):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.ReLU()
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU()
         )
         self.fc = nn.Sequential(
-            nn.Linear(64 * ROWS * COLS, 512), nn.ReLU(),
+            nn.Linear(64 * ROWS * COLS, 512),
+            nn.ReLU(),
             nn.Linear(512, num_actions)
         )
+
     def forward(self, x):
         x = self.conv(x)
         x = x.view(x.size(0), -1)
         return self.fc(x)
 
+# --- 2. The Optimized Environment ---
 class FruitBoxEnv:
     def __init__(self):
         self.all_rects = []
@@ -82,6 +56,7 @@ class FruitBoxEnv:
                 for r2 in range(r1, ROWS):
                     for c2 in range(c1, COLS):
                         self.all_rects.append((r1, c1, r2, c2))
+        
         self.action_size = len(self.all_rects)
         rects = np.array(self.all_rects)
         self.r1, self.c1, self.r2, self.c2 = rects[:,0], rects[:,1], rects[:,2]+1, rects[:,3]+1
@@ -107,10 +82,12 @@ class FruitBoxEnv:
         cleared = np.count_nonzero(self.grid[r1:r2+1, c1:c2+1])
         self.grid[r1:r2+1, c1:c2+1] = 0
         self.score += cleared
+        
         mask = self.get_valid_mask()
         done = not np.any(mask)
         return self.get_state(), float(cleared), done, mask
 
+# --- 3. The Double DQN Agent ---
 class Agent:
     def __init__(self, action_size):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -118,12 +95,14 @@ class Agent:
         self.target_net = FruitBoxCNN(action_size).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LR)
-        self.memory = ReplayBuffer(MEMORY_SIZE, (ROWS, COLS))
+        self.memory = collections.deque(maxlen=MEMORY_SIZE)
         self.steps = 0
 
     def select_action(self, state, mask, epsilon, greedy=False):
         if not greedy and random.random() < epsilon:
-            return random.choice(np.where(mask == True)[0])
+            valid_indices = np.where(mask == True)[0]
+            return random.choice(valid_indices)
+        
         state_t = torch.as_tensor(state, device=self.device).view(1, 1, ROWS, COLS)
         with torch.no_grad():
             q_vals = self.policy_net(state_t).squeeze()
@@ -131,23 +110,34 @@ class Agent:
             return q_vals.argmax().item()
 
     def train_step(self):
-        if self.memory.size < BATCH_SIZE: return 0
-        s, a, r, ns, nm, d = self.memory.sample(BATCH_SIZE)
-        s_t, a_t, r_t = torch.as_tensor(s, device=self.device).unsqueeze(1), torch.as_tensor(a, device=self.device), torch.as_tensor(r, device=self.device).squeeze()
-        ns_t, nm_t, d_t = torch.as_tensor(ns, device=self.device).unsqueeze(1), torch.as_tensor(nm, device=self.device), torch.as_tensor(d, device=self.device).squeeze()
+        if len(self.memory) < BATCH_SIZE: return 0
+        
+        batch = random.sample(self.memory, BATCH_SIZE)
+        s, a, r, ns, nm, d = zip(*batch)
+
+        s_t = torch.as_tensor(np.array(s), device=self.device).unsqueeze(1)
+        a_t = torch.as_tensor(a, device=self.device).unsqueeze(1)
+        r_t = torch.as_tensor(r, device=self.device, dtype=torch.float)
+        ns_t = torch.as_tensor(np.array(ns), device=self.device).unsqueeze(1)
+        nm_t = torch.as_tensor(np.array(nm), device=self.device)
+        d_t = torch.as_tensor(d, device=self.device, dtype=torch.float)
 
         current_q = self.policy_net(s_t).gather(1, a_t).squeeze()
+        
         with torch.no_grad():
-            # STANDARD DQN: Just take max of target network
-            next_q_vals = self.target_net(ns_t)
-            next_q_vals[~nm_t] = -1e9
-            max_next_q = next_q_vals.max(1)[0]
-            expected_q = r_t + (GAMMA * max_next_q * (1 - d_t))
+            # Double DQN: Policy picks best action, Target evaluates value
+            next_policy_q = self.policy_net(ns_t)
+            next_policy_q[~nm_t] = -1e9
+            next_actions = next_policy_q.argmax(dim=1, keepdim=True)
+            
+            next_target_q = self.target_net(ns_t).gather(1, next_actions).squeeze()
+            expected_q = r_t + (GAMMA * next_target_q * (1 - d_t))
 
         loss = F.smooth_l1_loss(current_q, expected_q)
-        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
         if self.steps % TARGET_UPDATE == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
         return loss.item()
@@ -163,6 +153,7 @@ def evaluate(agent):
         state, _, done, _ = eval_env.step(action)
     return eval_env.score
 
+# --- 4. Main Loop ---
 def main():
     if not os.path.exists(CSV_FILE):
         with open(CSV_FILE, mode='w', newline='') as f:
@@ -173,6 +164,7 @@ def main():
     screen = pygame.display.set_mode((COLS*BLOCK_SIZE + 100, ROWS*BLOCK_SIZE + 100))
     env = FruitBoxEnv()
     agent = Agent(env.action_size)
+    
     score_window = collections.deque(maxlen=100)
     
     for episode in range(1, 10001):
@@ -180,20 +172,41 @@ def main():
         mask = env.get_valid_mask()
         done = False
         ep_losses = []
+
         while not done:
             epsilon = max(EPS_END, EPS_START - agent.steps / EPS_DECAY)
             action = agent.select_action(state, mask, epsilon)
             next_state, reward, done, next_mask = env.step(action)
-            agent.memory.push(state, action, reward, next_state, mask, done)
-            state, mask, agent.steps = next_state, next_mask, agent.steps + 1
+            
+            agent.memory.append((state, action, reward, next_state, next_mask, done))
+            state, mask = next_state, next_mask
+            agent.steps += 1
+            
             loss = agent.train_step()
             if loss: ep_losses.append(loss)
+
         score_window.append(env.score)
-        avg100, avg_ep_loss, greedy_eval = np.mean(score_window), np.mean(ep_losses) if ep_losses else 0, evaluate(agent)
+        avg100 = np.mean(score_window)
+        avg_ep_loss = np.mean(ep_losses) if ep_losses else 0
+        greedy_eval = evaluate(agent)
+
         with open(CSV_FILE, mode='a', newline='') as f:
-            csv.writer(f).writerow([episode, env.score, round(avg100, 2), round(epsilon, 3), round(avg_ep_loss, 4), greedy_eval])
+            writer = csv.writer(f)
+            writer.writerow([episode, env.score, round(avg100, 2), round(epsilon, 3), round(avg_ep_loss, 4), greedy_eval])
+
         if episode % LOG_EVERY == 0:
-            print(f"Episode {episode} | score={env.score} | avg100={avg100:.2f} | epsilon={epsilon:.3f} | replay={agent.memory.size} | loss={avg_ep_loss:.4f} | greedy_eval={greedy_eval:.2f}")
+            print(f"Episode {episode} | score={env.score} | avg100={avg100:.2f} | "
+                  f"epsilon={epsilon:.3f} | replay={len(agent.memory)} | "
+                  f"loss={avg_ep_loss:.4f} | greedy_eval={greedy_eval:.2f}")
+
+        if episode % RENDER_EVERY == 0:
+            screen.fill((30,30,30))
+            for r in range(ROWS):
+                for c in range(COLS):
+                    if env.grid[r,c] > 0:
+                        pygame.draw.rect(screen, (100, 100, 250), (c*30+50, r*30+50, 28, 28))
+            pygame.display.flip()
+            pygame.event.pump()
 
 if __name__ == "__main__":
     main()

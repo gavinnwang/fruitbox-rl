@@ -4,7 +4,7 @@ import random
 from fruitbox_rl.algorithms.rectangle_finder import find_valid_rectangles
 
 class FruitBoxEnv:
-    def __init__(self, rows=10, cols=17, seed=None, target=10):
+    def __init__(self, rows=17, cols=10, seed=None, target=10):
         self.rows = rows
         self.cols = cols
         self.target = target
